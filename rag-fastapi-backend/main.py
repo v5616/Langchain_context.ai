@@ -34,7 +34,7 @@ app.add_middleware(
 
 vector_store: FAISS | None = None
 rag_chain: Any = None
-indexed_document_name: str | None = None
+indexed_document_names: list[str] = []
 
 
 class ChatQuery(BaseModel):
@@ -50,44 +50,69 @@ class HealthResponse(BaseModel):
 async def health() -> HealthResponse:
     return HealthResponse(
         status="ready" if rag_chain is not None else "waiting_for_document",
-        indexed_document=indexed_document_name,
+        indexed_document=", ".join(indexed_document_names) or None,
     )
 
 
 @app.post("/api/upload")
-async def upload_document(file: UploadFile = File(...)) -> dict[str, str]:
-    global indexed_document_name, rag_chain, vector_store
+async def upload_document(files: list[UploadFile] = File(...)) -> dict[str, object]:
+    global indexed_document_names, rag_chain, vector_store
 
-    filename = Path(file.filename or "document.pdf").name
-    if Path(filename).suffix.lower() != ".pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    if len(files) > 10:
+        raise HTTPException(status_code=400, detail="Upload up to 10 PDFs at a time.")
     if not os.getenv("GOOGLE_API_KEY"):
         raise HTTPException(
             status_code=503,
             detail="GOOGLE_API_KEY is not configured on the backend.",
         )
 
-    contents = await file.read(MAX_UPLOAD_BYTES + 1)
-    if len(contents) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="PDF files must be 20MB or smaller.")
-
-    temporary_path: str | None = None
     stage = "saving the PDF"
     try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temporary_file:
-            temporary_file.write(contents)
-            temporary_path = temporary_file.name
-
-        stage = "reading the PDF"
-        documents = PyPDFLoader(temporary_path).load()
-        if not documents:
-            raise HTTPException(status_code=422, detail="The PDF does not contain readable pages.")
-
-        stage = "splitting the PDF into chunks"
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = splitter.split_documents(documents)
+        chunks: list[Document] = []
+        filenames: list[str] = []
+
+        for file in files:
+            filename = Path(file.filename or "document.pdf").name
+            if Path(filename).suffix.lower() != ".pdf":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{filename} is not a PDF. Only PDF files are supported.",
+                )
+
+            stage = f"reading {filename}"
+            contents = await file.read(MAX_UPLOAD_BYTES + 1)
+            if len(contents) > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"{filename} exceeds the 20MB per-file limit.",
+                )
+
+            temporary_path: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temporary_file:
+                    temporary_file.write(contents)
+                    temporary_path = temporary_file.name
+
+                documents = PyPDFLoader(temporary_path).load()
+                if not documents:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"{filename} does not contain readable pages.",
+                    )
+                for document in documents:
+                    document.metadata["source"] = filename
+                chunks.extend(splitter.split_documents(documents))
+                filenames.append(filename)
+            finally:
+                if temporary_path:
+                    Path(temporary_path).unlink(missing_ok=True)
+
         if not chunks:
-            raise HTTPException(status_code=422, detail="The PDF contains no extractable text.")
+            raise HTTPException(
+                status_code=422,
+                detail="The selected PDFs contain no extractable text.",
+            )
 
         embedding_model = os.getenv(
             "GOOGLE_EMBEDDING_MODEL", "models/gemini-embedding-001"
@@ -123,8 +148,11 @@ async def upload_document(file: UploadFile = File(...)) -> dict[str, str]:
 
         vector_store = new_vector_store
         rag_chain = new_rag_chain
-        indexed_document_name = filename
-        return {"message": "Document uploaded, embedded, and indexed successfully."}
+        indexed_document_names = filenames
+        return {
+            "message": "Documents uploaded, embedded, and indexed successfully.",
+            "documents": filenames,
+        }
     except HTTPException:
         raise
     except Exception as error:
@@ -132,9 +160,8 @@ async def upload_document(file: UploadFile = File(...)) -> dict[str, str]:
             status_code=500, detail=f"Failed while {stage}: {error}"
         ) from error
     finally:
-        if temporary_path:
-            Path(temporary_path).unlink(missing_ok=True)
-        await file.close()
+        for file in files:
+            await file.close()
 
 
 @app.post("/api/chat")
@@ -164,7 +191,7 @@ def _source_metadata(documents: list[Document]) -> list[str]:
             continue
         seen.add(source)
         page_label = f" · p.{source[1]}" if source[1] is not None else ""
-        sources.append(f"{indexed_document_name or Path(source[0]).name}{page_label}")
+        sources.append(f"{Path(source[0]).name}{page_label}")
     return sources
 
 
